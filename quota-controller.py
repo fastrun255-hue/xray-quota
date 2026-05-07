@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 
 import copy
+import base64
 import hashlib
 import html
 import json
 import os
 import signal
 import shutil
+import secrets
 import subprocess
 import sys
 import threading
@@ -46,6 +48,8 @@ XRAY_WS_PATH = os.environ.get("XRAY_WS_PATH", "").strip()
 NGINX_GENERATED_CONFIG = os.environ.get("NGINX_GENERATED_CONFIG", "/etc/nginx/http.d/xray-quota.conf")
 QUOTA_UI_HOST = os.environ.get("QUOTA_UI_HOST", "0.0.0.0")
 QUOTA_UI_PORT = int(os.environ.get("QUOTA_UI_PORT", "9090"))
+ADMIN_USERNAME = os.environ.get("ADMIN_USERNAME", "")
+ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "")
 QUOTA_USER_RESERVED_FIELDS = {"uuid", "daily_limit_bytes", "reset_interval_hours", "level", "client"}
 
 
@@ -1120,6 +1124,49 @@ class QuotaUiHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def send_admin_auth_required(self) -> None:
+        body = b"admin authentication required"
+        self.send_response(401)
+        self.send_header("WWW-Authenticate", 'Basic realm="xray-quota-admin"')
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def admin_auth_enabled(self) -> bool:
+        return bool(ADMIN_USERNAME or ADMIN_PASSWORD)
+
+    def admin_authenticated(self) -> bool:
+        if not self.admin_auth_enabled():
+            return True
+
+        if not ADMIN_USERNAME or not ADMIN_PASSWORD:
+            log("[quota-ui] admin auth is partially configured; set both ADMIN_USERNAME and ADMIN_PASSWORD")
+            return False
+
+        header = self.headers.get("Authorization", "")
+        if not header.startswith("Basic "):
+            return False
+
+        try:
+            decoded = base64.b64decode(header[6:], validate=True).decode("utf-8")
+        except Exception:
+            return False
+
+        username, separator, password = decoded.partition(":")
+        if not separator:
+            return False
+
+        return secrets.compare_digest(username, ADMIN_USERNAME) and secrets.compare_digest(password, ADMIN_PASSWORD)
+
+    def require_admin_auth(self) -> bool:
+        if self.admin_authenticated():
+            return True
+
+        self.send_admin_auth_required()
+        return False
+
     def do_GET(self) -> None:
         parsed = urlparse(self.path)
         params = parse_qs(parsed.query)
@@ -1136,11 +1183,17 @@ class QuotaUiHandler(BaseHTTPRequestHandler):
             return
 
         if parsed.path == "/api/admin":
+            if not self.require_admin_auth():
+                return
+
             body = json.dumps(quota_status_for_all_users(), sort_keys=True).encode("utf-8")
             self.send_bytes(200, "application/json; charset=utf-8", body)
             return
 
         if parsed.path == "/admin":
+            if not self.require_admin_auth():
+                return
+
             body = admin_ui_html().encode("utf-8")
             self.send_bytes(200, "text/html; charset=utf-8", body)
             return

@@ -161,6 +161,8 @@ XRAY_WS_PATH=
 NGINX_GENERATED_CONFIG=/etc/nginx/http.d/xray-quota.conf
 QUOTA_UI_HOST=0.0.0.0
 QUOTA_UI_PORT=9090
+ADMIN_USERNAME=
+ADMIN_PASSWORD=
 XRAY_TEMPLATE=/app/config/xray-template.json
 QUOTA_CONFIG=/app/config/quota.json
 XRAY_GENERATED_CONFIG=/etc/xray/config.json
@@ -277,6 +279,8 @@ The admin page shows every user's traffic limit, current usage, remaining usage,
 /admin
 /api/admin
 ```
+
+Set both `ADMIN_USERNAME` and `ADMIN_PASSWORD` to protect `/admin` and `/api/admin` with browser Basic Auth. If both are empty, the admin page is open.
 
 Expose container port `9090` in the PaaS only if users should access this page directly instead of through the default HTTP frontend.
 
