@@ -31,6 +31,7 @@ quota:
     user1:
       uuid: 00000000-0000-4000-8000-000000000001
       daily_limit_bytes: 2147483648
+      reset_interval_hours: 24
       flow: xtls-rprx-vision
 ```
 
@@ -47,6 +48,7 @@ Equivalent JSON is also accepted:
       "user1": {
         "uuid": "00000000-0000-4000-8000-000000000001",
         "daily_limit_bytes": 2147483648,
+        "reset_interval_hours": 24,
         "flow": "xtls-rprx-vision"
       }
     }
@@ -54,9 +56,9 @@ Equivalent JSON is also accepted:
 }
 ```
 
-The `sing-box` object is your full sing-box config. The `xray-template` object is your full Xray config without real clients in the quota-managed inbound. The `quota` object contains users and their daily byte limits.
+The `sing-box` object is your full sing-box config. The `xray-template` object is your full Xray config without real clients in the quota-managed inbound. The `quota` object contains users, traffic limits, and reset intervals.
 
-Quota user fields other than `uuid`, `daily_limit_bytes`, `level`, and `client` are passed into the generated Xray client object. This is useful for VLESS fields such as `flow`.
+Quota user fields other than `uuid`, `daily_limit_bytes`, `reset_interval_hours`, `level`, and `client` are passed into the generated Xray client object. This is useful for VLESS fields such as `flow`.
 
 ## Separate File Mode
 
@@ -88,7 +90,7 @@ Without a persistent `/data` volume, users' daily usage can reset on redeploy.
 
 ## Quota Sizing
 
-`daily_limit_bytes` is the daily cap for one user. Examples:
+`daily_limit_bytes` is the traffic cap for one user's reset period. Examples:
 
 ```text
 1 GiB  = 1073741824
@@ -102,6 +104,40 @@ If someone pays for 90 GiB/month, a simple daily quota is:
 ```text
 90 * 1073741824 / 30 = 3221225472 bytes/day
 ```
+
+## Per-User Reset Intervals
+
+Global `reset_interval_hours` is the default for every user. A user can override it:
+
+```json
+{
+  "reset_interval_hours": 24,
+  "users": {
+    "daily-user": {
+      "uuid": "00000000-0000-4000-8000-000000000001",
+      "daily_limit_bytes": 5368709120,
+      "reset_interval_hours": 24
+    },
+    "weekly-user": {
+      "uuid": "00000000-0000-4000-8000-000000000002",
+      "daily_limit_bytes": 37580963840,
+      "reset_interval_hours": 168
+    },
+    "monthly-user": {
+      "uuid": "00000000-0000-4000-8000-000000000003",
+      "daily_limit_bytes": 161061273600,
+      "reset_interval_hours": 720
+    },
+    "one-time-user": {
+      "uuid": "00000000-0000-4000-8000-000000000004",
+      "daily_limit_bytes": 10737418240,
+      "reset_interval_hours": 0
+    }
+  }
+}
+```
+
+Use `reset_interval_hours: 0` for one-time users who should not reset automatically.
 
 ## Environment Variables
 
@@ -201,7 +237,7 @@ Generic Xray API pieces needed in your template:
 4. It starts sing-box and Xray.
 5. It queries Xray user stats through `xray api statsquery -pattern "user>>>"`.
 6. If a user exceeds their daily quota, the controller removes that user from generated Xray config and restarts Xray.
-7. After `reset_interval_hours`, default 24, all users are enabled again and counters reset.
+7. After each user's reset interval, that user's quota counter resets and the user is enabled again.
 8. Runtime config changes are reloaded automatically.
 9. Repeated stats API failures make the controller exit non-zero so the PaaS can restart the container.
 
@@ -210,6 +246,7 @@ Generic Xray API pieces needed in your template:
 By default, the container starts an HTTP frontend on public port `8080`:
 
 * `http://HOST/` shows the quota page.
+* `http://HOST/admin` shows the admin page for all users.
 * The Xray WebSocket path, for example `/myvpn`, is proxied to Xray internally.
 * The quota UI still runs internally on port `9090`.
 
@@ -223,15 +260,22 @@ http://HOST:9090/
 
 Users enter their username and see:
 
-* Daily limit in MB
-* Today traffic usage in MB
-* Remaining today usage in MB
+* Traffic limit in MB
+* Current period traffic usage in MB
+* Remaining current period usage in MB
 * Time till reset as `hr:min`
 
 There is also a JSON endpoint:
 
 ```text
 /api/quota?user=user01
+```
+
+The admin page shows every user's traffic limit, current usage, remaining usage, reset interval, time till reset, and active/disabled status:
+
+```text
+/admin
+/api/admin
 ```
 
 Expose container port `9090` in the PaaS only if users should access this page directly instead of through the default HTTP frontend.

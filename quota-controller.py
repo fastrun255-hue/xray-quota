@@ -14,7 +14,7 @@ import time
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import parse_qs, urlparse
 
 import yaml
@@ -46,7 +46,7 @@ XRAY_WS_PATH = os.environ.get("XRAY_WS_PATH", "").strip()
 NGINX_GENERATED_CONFIG = os.environ.get("NGINX_GENERATED_CONFIG", "/etc/nginx/http.d/xray-quota.conf")
 QUOTA_UI_HOST = os.environ.get("QUOTA_UI_HOST", "0.0.0.0")
 QUOTA_UI_PORT = int(os.environ.get("QUOTA_UI_PORT", "9090"))
-QUOTA_USER_RESERVED_FIELDS = {"uuid", "daily_limit_bytes", "level", "client"}
+QUOTA_USER_RESERVED_FIELDS = {"uuid", "daily_limit_bytes", "reset_interval_hours", "level", "client"}
 
 
 class XrayConfigError(Exception):
@@ -243,6 +243,9 @@ def normalize_quota(quota: Dict[str, Any]) -> Dict[str, Any]:
     quota.setdefault("reset_interval_hours", 24)
     quota.setdefault("check_interval_seconds", 60)
     quota.setdefault("users", {})
+    quota["reset_interval_hours"] = int(quota["reset_interval_hours"])
+    if quota["reset_interval_hours"] < 0:
+        raise ValueError("quota.json field `reset_interval_hours` cannot be negative")
 
     if not isinstance(quota["users"], dict):
         raise ValueError("quota.json field `users` must be an object")
@@ -263,56 +266,91 @@ def normalize_quota(quota: Dict[str, Any]) -> Dict[str, Any]:
         if user["daily_limit_bytes"] <= 0:
             raise ValueError(f"quota user `{username}` daily_limit_bytes must be greater than zero")
         user["level"] = int(user.get("level", 0))
+        if "reset_interval_hours" in user and user["reset_interval_hours"] is not None:
+            user["reset_interval_hours"] = int(user["reset_interval_hours"])
+            if user["reset_interval_hours"] < 0:
+                raise ValueError(f"quota user `{username}` reset_interval_hours cannot be negative")
 
     return quota
+
+
+def new_user_state(reset_started_at: Optional[int] = None) -> Dict[str, Any]:
+    return {
+        "used_bytes": 0,
+        "last_xray_total_bytes": 0,
+        "disabled": False,
+        "disabled_at": None,
+        "reset_started_at": int(reset_started_at or now_ts())
+    }
 
 
 def ensure_state_users(state: Dict[str, Any], quota: Dict[str, Any]) -> bool:
     changed = False
     state.setdefault("users", {})
+    inherited_reset_started_at = int(state.get("reset_started_at", now_ts()))
 
     for username in quota["users"].keys():
         if username not in state["users"]:
-            state["users"][username] = {
-                "used_bytes": 0,
-                "last_xray_total_bytes": 0,
-                "disabled": False,
-                "disabled_at": None
-            }
+            state["users"][username] = new_user_state(inherited_reset_started_at)
+            changed = True
+        elif "reset_started_at" not in state["users"][username]:
+            state["users"][username]["reset_started_at"] = inherited_reset_started_at
             changed = True
 
     return changed
 
 
-def should_reset(state: Dict[str, Any], quota: Dict[str, Any]) -> bool:
-    interval_hours = int(quota.get("reset_interval_hours", 24))
-    reset_started_at = int(state.get("reset_started_at", now_ts()))
+def user_reset_interval_hours(user: Dict[str, Any], quota: Dict[str, Any]) -> int:
+    value = user.get("reset_interval_hours", quota.get("reset_interval_hours", 24))
+    if value is None:
+        return 0
+    return int(value)
+
+
+def should_reset_user(user_state: Dict[str, Any], user: Dict[str, Any], quota: Dict[str, Any]) -> bool:
+    interval_hours = user_reset_interval_hours(user, quota)
+    if interval_hours <= 0:
+        return False
+
+    reset_started_at = int(user_state.get("reset_started_at", state_reset_started_at_fallback()))
     return now_ts() - reset_started_at >= interval_hours * 3600
 
 
-def reset_remaining_seconds(state: Dict[str, Any], quota: Dict[str, Any]) -> int:
-    interval_hours = int(quota.get("reset_interval_hours", 24))
-    reset_started_at = int(state.get("reset_started_at", now_ts()))
+def state_reset_started_at_fallback() -> int:
+    return now_ts()
+
+
+def reset_remaining_seconds_for_user(user_state: Dict[str, Any], user: Dict[str, Any], quota: Dict[str, Any]) -> Optional[int]:
+    interval_hours = user_reset_interval_hours(user, quota)
+    if interval_hours <= 0:
+        return None
+
+    reset_started_at = int(user_state.get("reset_started_at", now_ts()))
     next_reset_at = reset_started_at + interval_hours * 3600
     return max(0, next_reset_at - now_ts())
 
 
-def reset_state(state: Dict[str, Any], quota: Dict[str, Any]) -> Dict[str, Any]:
-    log("[quota] daily reset started")
-    state["reset_started_at"] = now_ts()
-    state["users"] = {}
+def reset_user_state(state: Dict[str, Any], username: str) -> bool:
+    previous_disabled = bool(state.get("users", {}).get(username, {}).get("disabled", False))
+    state["users"][username] = new_user_state()
+    return previous_disabled
 
-    for username in quota["users"].keys():
-        state["users"][username] = {
-            "used_bytes": 0,
-            "last_xray_total_bytes": 0,
-            "disabled": False,
-            "disabled_at": None
-        }
 
-    save_json_atomic(STATE_FILE, state)
-    log("[quota] daily reset completed")
-    return state
+def reset_due_users(state: Dict[str, Any], quota: Dict[str, Any]) -> Tuple[bool, bool]:
+    state_changed = False
+    disabled_changed = False
+
+    for username, user in quota["users"].items():
+        user_state = state["users"].setdefault(username, new_user_state())
+        if should_reset_user(user_state, user, quota):
+            interval_hours = user_reset_interval_hours(user, quota)
+            log(f"[quota] reset started for {username}: interval_hours={interval_hours}")
+            was_disabled = reset_user_state(state, username)
+            state_changed = True
+            disabled_changed = disabled_changed or was_disabled
+            log(f"[quota] reset completed for {username}")
+
+    return state_changed, disabled_changed
 
 
 def build_clients(quota: Dict[str, Any], state: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -707,7 +745,8 @@ def update_usage_from_xray(state: Dict[str, Any], quota: Dict[str, Any], stats: 
             "used_bytes": 0,
             "last_xray_total_bytes": 0,
             "disabled": False,
-            "disabled_at": None
+            "disabled_at": None,
+            "reset_started_at": now_ts()
         })
 
         if user_state.get("disabled", False):
@@ -739,7 +778,8 @@ def enforce_quota(state: Dict[str, Any], quota: Dict[str, Any]) -> bool:
             "used_bytes": 0,
             "last_xray_total_bytes": 0,
             "disabled": False,
-            "disabled_at": None
+            "disabled_at": None,
+            "reset_started_at": now_ts()
         })
 
         used = int(user_state.get("used_bytes", 0))
@@ -751,6 +791,25 @@ def enforce_quota(state: Dict[str, Any], quota: Dict[str, Any]) -> bool:
             log(f"[quota] disabled {username}: used={used}, limit={limit}")
 
     return disabled_changed
+
+
+def quota_status_record(username: str, user: Dict[str, Any], user_state: Dict[str, Any], quota: Dict[str, Any]) -> Dict[str, Any]:
+    daily_limit = int(user["daily_limit_bytes"])
+    used = int(user_state.get("used_bytes", 0))
+    remaining = max(0, daily_limit - used)
+    reset_remaining = reset_remaining_seconds_for_user(user_state, user, quota)
+
+    return {
+        "found": True,
+        "user": username,
+        "daily_limit_mb": bytes_to_mb(daily_limit),
+        "today_usage_mb": bytes_to_mb(used),
+        "remaining_today_mb": bytes_to_mb(remaining),
+        "reset_interval_hours": user_reset_interval_hours(user, quota),
+        "time_till_reset": seconds_to_hr_min(reset_remaining) if reset_remaining is not None else "never",
+        "disabled": bool(user_state.get("disabled", False)),
+        "disabled_at": user_state.get("disabled_at")
+    }
 
 
 def quota_status_for_user(username: str) -> Dict[str, Any]:
@@ -765,21 +824,132 @@ def quota_status_for_user(username: str) -> Dict[str, Any]:
             "error": "User not found"
         }
 
-    user = users[username]
-    user_state = state.get("users", {}).get(username, {})
-    daily_limit = int(user["daily_limit_bytes"])
-    used = int(user_state.get("used_bytes", 0))
-    remaining = max(0, daily_limit - used)
+    return quota_status_record(username, users[username], state.get("users", {}).get(username, {}), quota)
+
+
+def quota_status_for_all_users() -> Dict[str, Any]:
+    quota = normalize_quota(load_json(QUOTA_CONFIG))
+    state = load_state()
+    users = []
+
+    for username, user in sorted(quota.get("users", {}).items()):
+        users.append(quota_status_record(username, user, state.get("users", {}).get(username, {}), quota))
 
     return {
-        "found": True,
-        "user": username,
-        "daily_limit_mb": bytes_to_mb(daily_limit),
-        "today_usage_mb": bytes_to_mb(used),
-        "remaining_today_mb": bytes_to_mb(remaining),
-        "time_till_reset": seconds_to_hr_min(reset_remaining_seconds(state, quota)),
-        "disabled": bool(user_state.get("disabled", False))
+        "users": users,
+        "user_count": len(users)
     }
+
+
+def admin_ui_html() -> str:
+    data = quota_status_for_all_users()
+    rows = []
+
+    for item in data["users"]:
+        state_class = "disabled" if item.get("disabled") else "active"
+        state_label = "Disabled" if item.get("disabled") else "Active"
+        rows.append(f"""
+          <tr>
+            <td>{html.escape(str(item["user"]))}</td>
+            <td>{item["daily_limit_mb"]}</td>
+            <td>{item["today_usage_mb"]}</td>
+            <td>{item["remaining_today_mb"]}</td>
+            <td>{item["reset_interval_hours"]}</td>
+            <td>{item["time_till_reset"]}</td>
+            <td><span class="badge {state_class}">{state_label}</span></td>
+          </tr>
+        """)
+
+    table_rows = "\n".join(rows) if rows else '<tr><td colspan="7">No users configured.</td></tr>'
+
+    return f"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>VPN Quota Admin</title>
+  <style>
+    :root {{
+      color-scheme: dark;
+      --bg: #101114;
+      --panel: #181b22;
+      --text: #f4f7fb;
+      --muted: #a8b0bf;
+      --line: #32384a;
+      --green: #3ddc97;
+      --red: #ff6b6b;
+    }}
+    * {{ box-sizing: border-box; }}
+    body {{
+      margin: 0;
+      min-height: 100vh;
+      font-family: Arial, Helvetica, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      padding: 24px;
+    }}
+    main {{
+      width: min(1180px, 100%);
+      margin: 0 auto;
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 24px;
+    }}
+    .head {{
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 16px;
+      margin-bottom: 18px;
+    }}
+    h1 {{ margin: 0; font-size: 28px; }}
+    .meta {{ color: var(--muted); }}
+    .table-wrap {{ overflow-x: auto; border: 1px solid var(--line); border-radius: 8px; }}
+    table {{ width: 100%; border-collapse: collapse; min-width: 860px; }}
+    th, td {{ padding: 12px 14px; text-align: left; border-bottom: 1px solid var(--line); white-space: nowrap; }}
+    th {{ color: var(--muted); font-size: 13px; background: #11141c; }}
+    tr:last-child td {{ border-bottom: 0; }}
+    .badge {{
+      border-radius: 999px;
+      padding: 6px 10px;
+      font-size: 13px;
+      font-weight: 700;
+      white-space: nowrap;
+    }}
+    .badge.active {{ background: rgba(61, 220, 151, .15); color: var(--green); }}
+    .badge.disabled {{ background: rgba(255, 107, 107, .15); color: var(--red); }}
+    a {{ color: #8dbdff; text-decoration: none; }}
+  </style>
+</head>
+<body>
+  <main>
+    <div class="head">
+      <h1>VPN Quota Admin</h1>
+      <div class="meta">{data["user_count"]} user(s) &middot; <a href="/">User lookup</a></div>
+    </div>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>User</th>
+            <th>Limit MB</th>
+            <th>Used MB</th>
+            <th>Remaining MB</th>
+            <th>Reset Hours</th>
+            <th>Time Till Reset</th>
+            <th>Status</th>
+          </tr>
+        </thead>
+        <tbody>
+          {table_rows}
+        </tbody>
+      </table>
+    </div>
+  </main>
+</body>
+</html>
+"""
 
 
 def quota_ui_html(username: str = "", status: Optional[Dict[str, Any]] = None) -> str:
@@ -804,9 +974,9 @@ def quota_ui_html(username: str = "", status: Optional[Dict[str, Any]] = None) -
                 <span class="badge {state_class}">{state_label}</span>
               </div>
               <dl class="grid">
-                <div><dt>Daily limit</dt><dd>{status["daily_limit_mb"]} MB</dd></div>
-                <div><dt>Today traffic usage</dt><dd>{status["today_usage_mb"]} MB</dd></div>
-                <div><dt>Remaining today usage</dt><dd>{status["remaining_today_mb"]} MB</dd></div>
+                <div><dt>Traffic limit</dt><dd>{status["daily_limit_mb"]} MB</dd></div>
+                <div><dt>Current usage</dt><dd>{status["today_usage_mb"]} MB</dd></div>
+                <div><dt>Remaining usage</dt><dd>{status["remaining_today_mb"]} MB</dd></div>
                 <div><dt>Time till reset</dt><dd>{status["time_till_reset"]}</dd></div>
               </dl>
             </section>
@@ -965,6 +1135,16 @@ class QuotaUiHandler(BaseHTTPRequestHandler):
             self.send_bytes(200, "application/json; charset=utf-8", body)
             return
 
+        if parsed.path == "/api/admin":
+            body = json.dumps(quota_status_for_all_users(), sort_keys=True).encode("utf-8")
+            self.send_bytes(200, "application/json; charset=utf-8", body)
+            return
+
+        if parsed.path == "/admin":
+            body = admin_ui_html().encode("utf-8")
+            self.send_bytes(200, "text/html; charset=utf-8", body)
+            return
+
         if parsed.path not in ["/", "/quota"]:
             self.send_bytes(404, "text/plain; charset=utf-8", b"not found")
             return
@@ -1002,8 +1182,9 @@ def main() -> int:
     if ensure_state_users(state, quota):
         save_json_atomic(STATE_FILE, state)
 
-    if should_reset(state, quota):
-        state = reset_state(state, quota)
+    reset_changed, _ = reset_due_users(state, quota)
+    if reset_changed:
+        save_json_atomic(STATE_FILE, state)
 
     write_validated_singbox_config()
     write_validated_xray_config(quota, state)
@@ -1085,14 +1266,6 @@ def main() -> int:
             except Exception as e:
                 log(f"[warn] failed to reload runtime config: {e}")
 
-            if should_reset(state, quota):
-                state = reset_state(state, quota)
-                try:
-                    xray_proc = restart_xray(xray_proc, quota, state)
-                except (XrayConfigError, XrayProcessError) as e:
-                    log(f"[fatal] cannot reset users because generated config is invalid: {e}")
-                    return 1
-
             try:
                 stats = query_xray_user_stats()
                 stats_failure_count = 0
@@ -1109,8 +1282,10 @@ def main() -> int:
 
             usage_changed = update_usage_from_xray(state, quota, stats)
             disabled_changed = enforce_quota(state, quota)
+            reset_changed, reset_disabled_changed = reset_due_users(state, quota)
+            disabled_changed = disabled_changed or reset_disabled_changed
 
-            if usage_changed or disabled_changed:
+            if usage_changed or disabled_changed or reset_changed:
                 save_json_atomic(STATE_FILE, state)
 
             current_disabled_snapshot = json.dumps(
@@ -1118,12 +1293,12 @@ def main() -> int:
                 sort_keys=True
             )
 
-            if disabled_changed or current_disabled_snapshot != disabled_snapshot:
+            if reset_changed or disabled_changed or current_disabled_snapshot != disabled_snapshot:
                 disabled_snapshot = current_disabled_snapshot
                 try:
                     xray_proc = restart_xray(xray_proc, quota, state)
                 except (XrayConfigError, XrayProcessError) as e:
-                    log(f"[fatal] cannot enforce quota because generated config is invalid: {e}")
+                    log(f"[fatal] cannot update quota enforcement because generated config is invalid: {e}")
                     return 1
 
             interval = int(quota.get("check_interval_seconds", 60))
