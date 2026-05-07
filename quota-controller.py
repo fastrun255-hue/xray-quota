@@ -38,6 +38,12 @@ XRAY_INBOUND_TAG = os.environ.get("XRAY_INBOUND_TAG", "vless-in")
 XRAY_API_MAX_FAILURES = int(os.environ.get("XRAY_API_MAX_FAILURES", "5"))
 XRAY_STARTUP_GRACE_SECONDS = float(os.environ.get("XRAY_STARTUP_GRACE_SECONDS", "1"))
 SINGBOX_STARTUP_GRACE_SECONDS = float(os.environ.get("SINGBOX_STARTUP_GRACE_SECONDS", "1"))
+ENABLE_HTTP_FRONTEND = os.environ.get("ENABLE_HTTP_FRONTEND", "true").lower() in ["1", "true", "yes", "on"]
+PUBLIC_HTTP_PORT = int(os.environ.get("PUBLIC_HTTP_PORT", "8080"))
+XRAY_PROXY_HOST = os.environ.get("XRAY_PROXY_HOST", "127.0.0.1")
+XRAY_PROXY_PORT = int(os.environ.get("XRAY_PROXY_PORT", "10000"))
+XRAY_WS_PATH = os.environ.get("XRAY_WS_PATH", "").strip()
+NGINX_GENERATED_CONFIG = os.environ.get("NGINX_GENERATED_CONFIG", "/etc/nginx/http.d/xray-quota.conf")
 QUOTA_UI_HOST = os.environ.get("QUOTA_UI_HOST", "0.0.0.0")
 QUOTA_UI_PORT = int(os.environ.get("QUOTA_UI_PORT", "9090"))
 QUOTA_USER_RESERVED_FIELDS = {"uuid", "daily_limit_bytes", "level", "client"}
@@ -350,6 +356,36 @@ def inject_clients_into_xray_template(template: Dict[str, Any], clients: List[Di
     return config
 
 
+def find_xray_inbound(config: Dict[str, Any]) -> Dict[str, Any]:
+    for inbound in config.get("inbounds", []):
+        if inbound.get("tag") == XRAY_INBOUND_TAG:
+            return inbound
+
+    raise ValueError(f"xray-template.json has no inbound with tag `{XRAY_INBOUND_TAG}`")
+
+
+def detect_xray_ws_path(inbound: Dict[str, Any]) -> str:
+    if XRAY_WS_PATH:
+        path = XRAY_WS_PATH
+    else:
+        stream_settings = inbound.get("streamSettings", {})
+        ws_settings = stream_settings.get("wsSettings", {})
+        path = str(ws_settings.get("path", "/myvpn"))
+
+    if not path.startswith("/"):
+        path = f"/{path}"
+
+    return path
+
+
+def enable_local_xray_proxy(config: Dict[str, Any]) -> str:
+    inbound = find_xray_inbound(config)
+    ws_path = detect_xray_ws_path(inbound)
+    inbound["listen"] = XRAY_PROXY_HOST
+    inbound["port"] = XRAY_PROXY_PORT
+    return ws_path
+
+
 def ensure_xray_user_stats_enabled(config: Dict[str, Any], quota: Dict[str, Any]) -> None:
     config.setdefault("stats", {})
     policy = config.setdefault("policy", {})
@@ -373,6 +409,8 @@ def write_xray_config_file(path: str, quota: Dict[str, Any], state: Dict[str, An
     template = load_json(XRAY_TEMPLATE)
     clients = build_clients(quota, state)
     config = inject_clients_into_xray_template(template, clients)
+    if ENABLE_HTTP_FRONTEND:
+        enable_local_xray_proxy(config)
     ensure_xray_user_stats_enabled(config, quota)
     save_json_atomic(path, config)
     return len(clients)
@@ -424,6 +462,62 @@ def write_validated_singbox_config() -> None:
     log("[sing-box] generated validated config")
 
 
+def nginx_escape(value: str) -> str:
+    return value.replace("\\", "\\\\").replace("'", "\\'")
+
+
+def write_nginx_config() -> None:
+    template = load_json(XRAY_TEMPLATE)
+    config = inject_clients_into_xray_template(template, [])
+    ws_path = detect_xray_ws_path(find_xray_inbound(config))
+    target = Path(NGINX_GENERATED_CONFIG)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    body = f"""
+map $http_upgrade $connection_upgrade {{
+    default upgrade;
+    '' close;
+}}
+
+server {{
+    listen 0.0.0.0:{PUBLIC_HTTP_PORT};
+    server_name _;
+
+    location = /healthz {{
+        access_log off;
+        return 200 'ok\\n';
+    }}
+
+    location {nginx_escape(ws_path)} {{
+        proxy_pass http://{XRAY_PROXY_HOST}:{XRAY_PROXY_PORT};
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection $connection_upgrade;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_read_timeout 3600s;
+        proxy_send_timeout 3600s;
+    }}
+
+    location / {{
+        proxy_pass http://127.0.0.1:{QUOTA_UI_PORT};
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    }}
+}}
+""".lstrip()
+    target.write_text(body, encoding="utf-8")
+    log(f"[nginx] generated config on public port {PUBLIC_HTTP_PORT}; VPN path {ws_path}; quota UI on /")
+
+
+def validate_nginx_config() -> None:
+    result = subprocess.run(["nginx", "-t"], capture_output=True, text=True, timeout=10)
+    if result.returncode != 0:
+        raise RuntimeError((result.stderr or result.stdout).strip() or "nginx config test failed")
+
+
 def mark_current_xray_config_good() -> None:
     shutil.copyfile(XRAY_GENERATED_CONFIG, XRAY_LAST_GOOD_CONFIG)
 
@@ -454,6 +548,22 @@ def start_singbox_process(config_path: str = SINGBOX_GENERATED_CONFIG) -> subpro
         raise SingBoxProcessError(f"sing-box exited during startup with code {proc.returncode}")
 
     return proc
+
+
+def start_nginx_process() -> subprocess.Popen:
+    proc = start_process("nginx", ["nginx", "-g", "daemon off;"])
+    time.sleep(0.5)
+
+    if proc.poll() is not None:
+        raise RuntimeError(f"nginx exited during startup with code {proc.returncode}")
+
+    return proc
+
+
+def reload_nginx() -> None:
+    result = subprocess.run(["nginx", "-s", "reload"], capture_output=True, text=True, timeout=10)
+    if result.returncode != 0:
+        raise RuntimeError((result.stderr or result.stdout).strip() or "nginx reload failed")
 
 
 def start_process(name: str, args: List[str]) -> subprocess.Popen:
@@ -897,6 +1007,9 @@ def main() -> int:
 
     write_validated_singbox_config()
     write_validated_xray_config(quota, state)
+    if ENABLE_HTTP_FRONTEND:
+        write_nginx_config()
+        validate_nginx_config()
 
     config_hash = current_config_hash(config_mode)
     disabled_snapshot = json.dumps(
@@ -906,17 +1019,24 @@ def main() -> int:
 
     singbox_proc = None
     xray_proc = None
+    nginx_proc = None
     quota_ui_server = None
     stats_failure_count = 0
 
     try:
         quota_ui_server = start_quota_ui_server()
+        if ENABLE_HTTP_FRONTEND:
+            nginx_proc = start_nginx_process()
         singbox_proc = start_singbox_process(SINGBOX_GENERATED_CONFIG)
         mark_current_singbox_config_good()
         xray_proc = start_xray_process(XRAY_GENERATED_CONFIG)
         mark_current_xray_config_good()
 
         while True:
+            if ENABLE_HTTP_FRONTEND and nginx_proc is not None and nginx_proc.poll() is not None:
+                log(f"[fatal] nginx exited with code {nginx_proc.returncode}")
+                return nginx_proc.returncode or 1
+
             if singbox_proc.poll() is not None:
                 log(f"[warn] sing-box exited with code {singbox_proc.returncode}, restarting")
                 try:
@@ -946,6 +1066,10 @@ def main() -> int:
 
                     write_validated_singbox_config()
                     write_validated_xray_config(next_quota, next_state)
+                    if ENABLE_HTTP_FRONTEND:
+                        write_nginx_config()
+                        validate_nginx_config()
+                        reload_nginx()
 
                     next_singbox_proc = restart_singbox_from_generated_config(singbox_proc)
                     next_xray_proc = restart_xray_from_generated_config(xray_proc)
@@ -1013,6 +1137,7 @@ def main() -> int:
             quota_ui_server.server_close()
         stop_process("xray", xray_proc)
         stop_process("sing-box", singbox_proc)
+        stop_process("nginx", nginx_proc)
 
     return 0
 

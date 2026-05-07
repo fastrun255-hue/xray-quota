@@ -117,6 +117,12 @@ SINGBOX_CONFIG=/app/config/sing-box.json
 SINGBOX_GENERATED_CONFIG=/etc/sing-box/config.json
 SINGBOX_LAST_GOOD_CONFIG=/etc/sing-box/config.last-good.json
 SINGBOX_STARTUP_GRACE_SECONDS=1
+ENABLE_HTTP_FRONTEND=true
+PUBLIC_HTTP_PORT=8080
+XRAY_PROXY_HOST=127.0.0.1
+XRAY_PROXY_PORT=10000
+XRAY_WS_PATH=
+NGINX_GENERATED_CONFIG=/etc/nginx/http.d/xray-quota.conf
 QUOTA_UI_HOST=0.0.0.0
 QUOTA_UI_PORT=9090
 XRAY_TEMPLATE=/app/config/xray-template.json
@@ -201,7 +207,15 @@ Generic Xray API pieces needed in your template:
 
 ## Quota UI
 
-The container exposes a simple no-login quota page on:
+By default, the container starts an HTTP frontend on public port `8080`:
+
+* `http://HOST/` shows the quota page.
+* The Xray WebSocket path, for example `/myvpn`, is proxied to Xray internally.
+* The quota UI still runs internally on port `9090`.
+
+This lets PaaS providers expose one HTTP service port while keeping the VPN and quota page on the same domain.
+
+If `ENABLE_HTTP_FRONTEND=false`, the quota page is exposed directly on:
 
 ```text
 http://HOST:9090/
@@ -220,7 +234,7 @@ There is also a JSON endpoint:
 /api/quota?user=user01
 ```
 
-Expose container port `9090` in the PaaS if users should access this page directly.
+Expose container port `9090` in the PaaS only if users should access this page directly instead of through the default HTTP frontend.
 
 ## Security
 
