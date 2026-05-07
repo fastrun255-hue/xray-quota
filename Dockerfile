@@ -53,7 +53,11 @@ ENV XRAY_INBOUND_TAG=vless-in
 ENV XRAY_API_MAX_FAILURES=5
 ENV XRAY_STARTUP_GRACE_SECONDS=1
 ENV SINGBOX_STARTUP_GRACE_SECONDS=1
+ENV QUOTA_UI_HOST=0.0.0.0
+ENV QUOTA_UI_PORT=9090
 ENV XRAY_LOCATION_ASSET=/usr/local/share/xray
+
+EXPOSE 8080 9090
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
     CMD pgrep -x sing-box >/dev/null && pgrep -x xray >/dev/null || exit 1

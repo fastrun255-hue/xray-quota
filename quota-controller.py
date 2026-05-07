@@ -2,16 +2,20 @@
 
 import copy
 import hashlib
+import html
 import json
 import os
 import signal
 import shutil
 import subprocess
 import sys
+import threading
 import time
 from datetime import datetime, timezone
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+from urllib.parse import parse_qs, urlparse
 
 import yaml
 
@@ -34,6 +38,8 @@ XRAY_INBOUND_TAG = os.environ.get("XRAY_INBOUND_TAG", "vless-in")
 XRAY_API_MAX_FAILURES = int(os.environ.get("XRAY_API_MAX_FAILURES", "5"))
 XRAY_STARTUP_GRACE_SECONDS = float(os.environ.get("XRAY_STARTUP_GRACE_SECONDS", "1"))
 SINGBOX_STARTUP_GRACE_SECONDS = float(os.environ.get("SINGBOX_STARTUP_GRACE_SECONDS", "1"))
+QUOTA_UI_HOST = os.environ.get("QUOTA_UI_HOST", "0.0.0.0")
+QUOTA_UI_PORT = int(os.environ.get("QUOTA_UI_PORT", "9090"))
 QUOTA_USER_RESERVED_FIELDS = {"uuid", "daily_limit_bytes", "level", "client"}
 
 
@@ -90,6 +96,17 @@ def save_json_atomic(path: str, data: Dict[str, Any]) -> None:
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2, sort_keys=True)
     tmp.replace(target)
+
+
+def bytes_to_mb(value: int) -> float:
+    return round(int(value) / (1024 * 1024), 2)
+
+
+def seconds_to_hr_min(value: int) -> str:
+    seconds = max(0, int(value))
+    hours = seconds // 3600
+    minutes = (seconds % 3600) // 60
+    return f"{hours:02d}:{minutes:02d}"
 
 
 def file_hash(path: str) -> str:
@@ -265,6 +282,13 @@ def should_reset(state: Dict[str, Any], quota: Dict[str, Any]) -> bool:
     interval_hours = int(quota.get("reset_interval_hours", 24))
     reset_started_at = int(state.get("reset_started_at", now_ts()))
     return now_ts() - reset_started_at >= interval_hours * 3600
+
+
+def reset_remaining_seconds(state: Dict[str, Any], quota: Dict[str, Any]) -> int:
+    interval_hours = int(quota.get("reset_interval_hours", 24))
+    reset_started_at = int(state.get("reset_started_at", now_ts()))
+    next_reset_at = reset_started_at + interval_hours * 3600
+    return max(0, next_reset_at - now_ts())
 
 
 def reset_state(state: Dict[str, Any], quota: Dict[str, Any]) -> Dict[str, Any]:
@@ -619,6 +643,235 @@ def enforce_quota(state: Dict[str, Any], quota: Dict[str, Any]) -> bool:
     return disabled_changed
 
 
+def quota_status_for_user(username: str) -> Dict[str, Any]:
+    quota = normalize_quota(load_json(QUOTA_CONFIG))
+    state = load_state()
+    users = quota.get("users", {})
+
+    if username not in users:
+        return {
+            "found": False,
+            "user": username,
+            "error": "User not found"
+        }
+
+    user = users[username]
+    user_state = state.get("users", {}).get(username, {})
+    daily_limit = int(user["daily_limit_bytes"])
+    used = int(user_state.get("used_bytes", 0))
+    remaining = max(0, daily_limit - used)
+
+    return {
+        "found": True,
+        "user": username,
+        "daily_limit_mb": bytes_to_mb(daily_limit),
+        "today_usage_mb": bytes_to_mb(used),
+        "remaining_today_mb": bytes_to_mb(remaining),
+        "time_till_reset": seconds_to_hr_min(reset_remaining_seconds(state, quota)),
+        "disabled": bool(user_state.get("disabled", False))
+    }
+
+
+def quota_ui_html(username: str = "", status: Optional[Dict[str, Any]] = None) -> str:
+    safe_username = html.escape(username)
+    result = ""
+
+    if status:
+        if not status.get("found"):
+            result = f"""
+            <section class="result error">
+              <h2>User not found</h2>
+              <p>No quota entry exists for <strong>{safe_username}</strong>.</p>
+            </section>
+            """
+        else:
+            state_class = "disabled" if status.get("disabled") else "active"
+            state_label = "Disabled until reset" if status.get("disabled") else "Active"
+            result = f"""
+            <section class="result">
+              <div class="result-head">
+                <h2>{html.escape(str(status["user"]))}</h2>
+                <span class="badge {state_class}">{state_label}</span>
+              </div>
+              <dl class="grid">
+                <div><dt>Daily limit</dt><dd>{status["daily_limit_mb"]} MB</dd></div>
+                <div><dt>Today traffic usage</dt><dd>{status["today_usage_mb"]} MB</dd></div>
+                <div><dt>Remaining today usage</dt><dd>{status["remaining_today_mb"]} MB</dd></div>
+                <div><dt>Time till reset</dt><dd>{status["time_till_reset"]}</dd></div>
+              </dl>
+            </section>
+            """
+
+    return f"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>VPN Quota</title>
+  <style>
+    :root {{
+      color-scheme: dark;
+      --bg: #101114;
+      --panel: #181b22;
+      --panel-2: #202430;
+      --text: #f4f7fb;
+      --muted: #a8b0bf;
+      --line: #32384a;
+      --blue: #5ea1ff;
+      --green: #3ddc97;
+      --red: #ff6b6b;
+    }}
+    * {{ box-sizing: border-box; }}
+    body {{
+      margin: 0;
+      min-height: 100vh;
+      font-family: Arial, Helvetica, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      display: grid;
+      place-items: center;
+      padding: 24px;
+    }}
+    main {{
+      width: min(760px, 100%);
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 24px;
+    }}
+    h1 {{ margin: 0 0 20px; font-size: 28px; }}
+    form {{
+      display: grid;
+      grid-template-columns: 1fr auto;
+      gap: 12px;
+      margin-bottom: 18px;
+    }}
+    input, button {{
+      height: 44px;
+      border-radius: 6px;
+      border: 1px solid var(--line);
+      font-size: 16px;
+    }}
+    input {{
+      min-width: 0;
+      background: #0f1118;
+      color: var(--text);
+      padding: 0 14px;
+    }}
+    button {{
+      background: var(--blue);
+      color: #07111f;
+      font-weight: 700;
+      padding: 0 18px;
+      cursor: pointer;
+    }}
+    .result {{
+      background: var(--panel-2);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 18px;
+    }}
+    .result.error {{ border-color: var(--red); }}
+    .result-head {{
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 12px;
+      margin-bottom: 16px;
+    }}
+    h2 {{ margin: 0; font-size: 22px; }}
+    .badge {{
+      border-radius: 999px;
+      padding: 6px 10px;
+      font-size: 13px;
+      font-weight: 700;
+      white-space: nowrap;
+    }}
+    .badge.active {{ background: rgba(61, 220, 151, .15); color: var(--green); }}
+    .badge.disabled {{ background: rgba(255, 107, 107, .15); color: var(--red); }}
+    .grid {{
+      margin: 0;
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 12px;
+    }}
+    .grid div {{
+      background: #11141c;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      padding: 14px;
+      min-width: 0;
+    }}
+    dt {{ color: var(--muted); font-size: 13px; margin-bottom: 8px; }}
+    dd {{ margin: 0; font-size: 22px; font-weight: 700; overflow-wrap: anywhere; }}
+    @media (max-width: 560px) {{
+      main {{ padding: 18px; }}
+      form {{ grid-template-columns: 1fr; }}
+      .grid {{ grid-template-columns: 1fr; }}
+      .result-head {{ align-items: flex-start; flex-direction: column; }}
+    }}
+  </style>
+</head>
+<body>
+  <main>
+    <h1>VPN Quota</h1>
+    <form method="get" action="/">
+      <input name="user" value="{safe_username}" placeholder="Enter username, e.g. user01" autocomplete="username" autofocus>
+      <button type="submit">Check</button>
+    </form>
+    {result}
+  </main>
+</body>
+</html>
+"""
+
+
+class QuotaUiHandler(BaseHTTPRequestHandler):
+    server_version = "xray-quota-ui/1.0"
+
+    def log_message(self, format: str, *args: Any) -> None:
+        log(f"[quota-ui] {self.address_string()} {format % args}")
+
+    def send_bytes(self, status_code: int, content_type: str, body: bytes) -> None:
+        self.send_response(status_code)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self) -> None:
+        parsed = urlparse(self.path)
+        params = parse_qs(parsed.query)
+        username = params.get("user", [""])[0].strip()
+
+        if parsed.path == "/api/quota":
+            if not username:
+                body = json.dumps({"found": False, "error": "Missing user"}).encode("utf-8")
+                self.send_bytes(400, "application/json; charset=utf-8", body)
+                return
+
+            body = json.dumps(quota_status_for_user(username), sort_keys=True).encode("utf-8")
+            self.send_bytes(200, "application/json; charset=utf-8", body)
+            return
+
+        if parsed.path not in ["/", "/quota"]:
+            self.send_bytes(404, "text/plain; charset=utf-8", b"not found")
+            return
+
+        status = quota_status_for_user(username) if username else None
+        body = quota_ui_html(username, status).encode("utf-8")
+        self.send_bytes(200, "text/html; charset=utf-8", body)
+
+
+def start_quota_ui_server() -> ThreadingHTTPServer:
+    server = ThreadingHTTPServer((QUOTA_UI_HOST, QUOTA_UI_PORT), QuotaUiHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    log(f"[quota-ui] listening on {QUOTA_UI_HOST}:{QUOTA_UI_PORT}")
+    return server
+
+
 def graceful_shutdown(signum, frame) -> None:
     raise KeyboardInterrupt()
 
@@ -653,9 +906,11 @@ def main() -> int:
 
     singbox_proc = None
     xray_proc = None
+    quota_ui_server = None
     stats_failure_count = 0
 
     try:
+        quota_ui_server = start_quota_ui_server()
         singbox_proc = start_singbox_process(SINGBOX_GENERATED_CONFIG)
         mark_current_singbox_config_good()
         xray_proc = start_xray_process(XRAY_GENERATED_CONFIG)
@@ -753,6 +1008,9 @@ def main() -> int:
     except KeyboardInterrupt:
         log("[shutdown] received shutdown signal")
     finally:
+        if quota_ui_server is not None:
+            quota_ui_server.shutdown()
+            quota_ui_server.server_close()
         stop_process("xray", xray_proc)
         stop_process("sing-box", singbox_proc)
 

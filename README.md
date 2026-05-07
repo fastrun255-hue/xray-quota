@@ -117,6 +117,8 @@ SINGBOX_CONFIG=/app/config/sing-box.json
 SINGBOX_GENERATED_CONFIG=/etc/sing-box/config.json
 SINGBOX_LAST_GOOD_CONFIG=/etc/sing-box/config.last-good.json
 SINGBOX_STARTUP_GRACE_SECONDS=1
+QUOTA_UI_HOST=0.0.0.0
+QUOTA_UI_PORT=9090
 XRAY_TEMPLATE=/app/config/xray-template.json
 QUOTA_CONFIG=/app/config/quota.json
 XRAY_GENERATED_CONFIG=/etc/xray/config.json
@@ -196,6 +198,29 @@ Generic Xray API pieces needed in your template:
 7. After `reset_interval_hours`, default 24, all users are enabled again and counters reset.
 8. Runtime config changes are reloaded automatically.
 9. Repeated stats API failures make the controller exit non-zero so the PaaS can restart the container.
+
+## Quota UI
+
+The container exposes a simple no-login quota page on:
+
+```text
+http://HOST:9090/
+```
+
+Users enter their username and see:
+
+* Daily limit in MB
+* Today traffic usage in MB
+* Remaining today usage in MB
+* Time till reset as `hr:min`
+
+There is also a JSON endpoint:
+
+```text
+/api/quota?user=user01
+```
+
+Expose container port `9090` in the PaaS if users should access this page directly.
 
 ## Security
 
