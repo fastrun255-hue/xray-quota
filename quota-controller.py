@@ -1,0 +1,737 @@
+#!/usr/bin/env python3
+
+import copy
+import hashlib
+import json
+import os
+import signal
+import shutil
+import subprocess
+import sys
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
+
+SINGBOX_CONFIG = os.environ.get("SINGBOX_CONFIG", "/app/config/sing-box.json")
+SINGBOX_GENERATED_CONFIG = os.environ.get("SINGBOX_GENERATED_CONFIG", "/etc/sing-box/config.json")
+SINGBOX_LAST_GOOD_CONFIG = os.environ.get("SINGBOX_LAST_GOOD_CONFIG", "/etc/sing-box/config.last-good.json")
+XRAY_TEMPLATE = os.environ.get("XRAY_TEMPLATE", "/app/config/xray-template.json")
+QUOTA_CONFIG = os.environ.get("QUOTA_CONFIG", "/app/config/quota.json")
+COMBINED_CONFIG = os.environ.get("COMBINED_CONFIG", "/app/config/config.json")
+CONFIG_MODE = os.environ.get("CONFIG_MODE", "auto")
+RUNTIME_CONFIG_DIR = os.environ.get("RUNTIME_CONFIG_DIR", "/run/xray-quota")
+XRAY_GENERATED_CONFIG = os.environ.get("XRAY_GENERATED_CONFIG", "/etc/xray/config.json")
+XRAY_LAST_GOOD_CONFIG = os.environ.get("XRAY_LAST_GOOD_CONFIG", "/etc/xray/config.last-good.json")
+STATE_FILE = os.environ.get("STATE_FILE", "/data/usage-state.json")
+XRAY_API_SERVER = os.environ.get("XRAY_API_SERVER", "127.0.0.1:10085")
+XRAY_INBOUND_TAG = os.environ.get("XRAY_INBOUND_TAG", "vless-in")
+XRAY_API_MAX_FAILURES = int(os.environ.get("XRAY_API_MAX_FAILURES", "5"))
+XRAY_STARTUP_GRACE_SECONDS = float(os.environ.get("XRAY_STARTUP_GRACE_SECONDS", "1"))
+SINGBOX_STARTUP_GRACE_SECONDS = float(os.environ.get("SINGBOX_STARTUP_GRACE_SECONDS", "1"))
+QUOTA_USER_RESERVED_FIELDS = {"uuid", "daily_limit_bytes", "level", "client"}
+
+
+class XrayConfigError(Exception):
+    pass
+
+
+class XrayStatsError(Exception):
+    pass
+
+
+class XrayProcessError(Exception):
+    pass
+
+
+class SingBoxConfigError(Exception):
+    pass
+
+
+class SingBoxProcessError(Exception):
+    pass
+
+
+def log(message: str) -> None:
+    now = datetime.now(timezone.utc).isoformat()
+    print(f"[{now}] {message}", flush=True)
+
+
+def load_json(path: str) -> Dict[str, Any]:
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def save_json_atomic(path: str, data: Dict[str, Any]) -> None:
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    tmp = target.with_suffix(target.suffix + ".tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, sort_keys=True)
+    tmp.replace(target)
+
+
+def file_hash(path: str) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        while True:
+            chunk = f.read(1024 * 1024)
+            if not chunk:
+                break
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def combined_file_hash(paths: List[str]) -> str:
+    h = hashlib.sha256()
+    for path in paths:
+        h.update(path.encode("utf-8"))
+        h.update(b"\0")
+        h.update(file_hash(path).encode("ascii"))
+        h.update(b"\0")
+    return h.hexdigest()
+
+
+def required_separate_config_files_exist() -> bool:
+    return all(os.path.exists(path) for path in [SINGBOX_CONFIG, XRAY_TEMPLATE, QUOTA_CONFIG])
+
+
+def get_config_section(bundle: Dict[str, Any], *names: str) -> Dict[str, Any]:
+    for name in names:
+        value = bundle.get(name)
+        if value is not None:
+            if not isinstance(value, dict):
+                raise ValueError(f"combined config section `{name}` must be an object")
+            return value
+
+    raise ValueError(f"combined config is missing section `{names[0]}`")
+
+
+def extract_combined_config() -> None:
+    bundle = load_json(COMBINED_CONFIG)
+    if not isinstance(bundle, dict):
+        raise ValueError("combined config must be a JSON object")
+
+    runtime_dir = Path(RUNTIME_CONFIG_DIR)
+    runtime_dir.mkdir(parents=True, exist_ok=True)
+
+    save_json_atomic(str(runtime_dir / "sing-box.json"), get_config_section(bundle, "sing-box", "sing_box"))
+    save_json_atomic(
+        str(runtime_dir / "xray-template.json"),
+        get_config_section(bundle, "xray-template", "xray_template", "xray")
+    )
+    save_json_atomic(str(runtime_dir / "quota.json"), get_config_section(bundle, "quota"))
+
+
+def configure_runtime_config_files() -> str:
+    global SINGBOX_CONFIG, XRAY_TEMPLATE, QUOTA_CONFIG
+
+    mode = CONFIG_MODE.lower()
+    if mode not in ["auto", "separate", "combined"]:
+        raise ValueError("CONFIG_MODE must be `auto`, `separate`, or `combined`")
+
+    if mode in ["auto", "separate"] and required_separate_config_files_exist():
+        log("[config] using separate config files")
+        return "separate"
+
+    if mode == "separate":
+        raise FileNotFoundError("CONFIG_MODE=separate but one or more separate config files are missing")
+
+    if not os.path.exists(COMBINED_CONFIG):
+        raise FileNotFoundError(
+            "missing runtime config: provide separate sing-box/xray-template/quota files or a combined config.json"
+        )
+
+    runtime_dir = Path(RUNTIME_CONFIG_DIR)
+    SINGBOX_CONFIG = str(runtime_dir / "sing-box.json")
+    XRAY_TEMPLATE = str(runtime_dir / "xray-template.json")
+    QUOTA_CONFIG = str(runtime_dir / "quota.json")
+    extract_combined_config()
+    log("[config] using combined config file")
+    return "combined"
+
+
+def current_config_hash(config_mode: str) -> str:
+    if config_mode == "combined":
+        return file_hash(COMBINED_CONFIG)
+
+    return combined_file_hash([SINGBOX_CONFIG, XRAY_TEMPLATE, QUOTA_CONFIG])
+
+
+def now_ts() -> int:
+    return int(time.time())
+
+
+def default_state() -> Dict[str, Any]:
+    ts = now_ts()
+    return {
+        "reset_started_at": ts,
+        "users": {}
+    }
+
+
+def load_state() -> Dict[str, Any]:
+    if not os.path.exists(STATE_FILE):
+        state = default_state()
+        save_json_atomic(STATE_FILE, state)
+        return state
+
+    try:
+        return load_json(STATE_FILE)
+    except Exception as e:
+        log(f"[warn] failed to read state file, creating a new state: {e}")
+        state = default_state()
+        save_json_atomic(STATE_FILE, state)
+        return state
+
+
+def normalize_quota(quota: Dict[str, Any]) -> Dict[str, Any]:
+    quota.setdefault("reset_interval_hours", 24)
+    quota.setdefault("check_interval_seconds", 60)
+    quota.setdefault("users", {})
+
+    if not isinstance(quota["users"], dict):
+        raise ValueError("quota.json field `users` must be an object")
+
+    for username, user in quota["users"].items():
+        if not isinstance(user, dict):
+            raise ValueError(f"quota user `{username}` must be an object")
+        if ">>>" in username:
+            raise ValueError(f"quota user `{username}` cannot contain `>>>`")
+        if "uuid" not in user:
+            raise ValueError(f"quota user `{username}` is missing uuid")
+        if "daily_limit_bytes" not in user:
+            raise ValueError(f"quota user `{username}` is missing daily_limit_bytes")
+        if "client" in user and not isinstance(user["client"], dict):
+            raise ValueError(f"quota user `{username}` field `client` must be an object")
+        user.setdefault("level", 0)
+        user["daily_limit_bytes"] = int(user["daily_limit_bytes"])
+        if user["daily_limit_bytes"] <= 0:
+            raise ValueError(f"quota user `{username}` daily_limit_bytes must be greater than zero")
+        user["level"] = int(user.get("level", 0))
+
+    return quota
+
+
+def ensure_state_users(state: Dict[str, Any], quota: Dict[str, Any]) -> bool:
+    changed = False
+    state.setdefault("users", {})
+
+    for username in quota["users"].keys():
+        if username not in state["users"]:
+            state["users"][username] = {
+                "used_bytes": 0,
+                "last_xray_total_bytes": 0,
+                "disabled": False,
+                "disabled_at": None
+            }
+            changed = True
+
+    return changed
+
+
+def should_reset(state: Dict[str, Any], quota: Dict[str, Any]) -> bool:
+    interval_hours = int(quota.get("reset_interval_hours", 24))
+    reset_started_at = int(state.get("reset_started_at", now_ts()))
+    return now_ts() - reset_started_at >= interval_hours * 3600
+
+
+def reset_state(state: Dict[str, Any], quota: Dict[str, Any]) -> Dict[str, Any]:
+    log("[quota] daily reset started")
+    state["reset_started_at"] = now_ts()
+    state["users"] = {}
+
+    for username in quota["users"].keys():
+        state["users"][username] = {
+            "used_bytes": 0,
+            "last_xray_total_bytes": 0,
+            "disabled": False,
+            "disabled_at": None
+        }
+
+    save_json_atomic(STATE_FILE, state)
+    log("[quota] daily reset completed")
+    return state
+
+
+def build_clients(quota: Dict[str, Any], state: Dict[str, Any]) -> List[Dict[str, Any]]:
+    clients = []
+
+    for username, user in quota["users"].items():
+        user_state = state.get("users", {}).get(username, {})
+        if user_state.get("disabled", False):
+            continue
+
+        client = copy.deepcopy(user.get("client", {}))
+        for key, value in user.items():
+            if key not in QUOTA_USER_RESERVED_FIELDS:
+                client[key] = value
+
+        client.update({
+            "id": user["uuid"],
+            "email": username,
+            "level": int(user.get("level", 0))
+        })
+        clients.append(client)
+
+    return clients
+
+
+def inject_clients_into_xray_template(template: Dict[str, Any], clients: List[Dict[str, Any]]) -> Dict[str, Any]:
+    config = copy.deepcopy(template)
+    inbounds = config.get("inbounds", [])
+
+    found = False
+    for inbound in inbounds:
+        if inbound.get("tag") == XRAY_INBOUND_TAG:
+            inbound.setdefault("settings", {})
+            inbound["settings"]["clients"] = clients
+            found = True
+            break
+
+    if not found:
+        raise ValueError(f"xray-template.json has no inbound with tag `{XRAY_INBOUND_TAG}`")
+
+    return config
+
+
+def ensure_xray_user_stats_enabled(config: Dict[str, Any], quota: Dict[str, Any]) -> None:
+    config.setdefault("stats", {})
+    policy = config.setdefault("policy", {})
+    levels = policy.setdefault("levels", {})
+
+    if not isinstance(levels, dict):
+        raise ValueError("xray-template.json field `policy.levels` must be an object")
+
+    for user in quota["users"].values():
+        level = str(int(user.get("level", 0)))
+        level_policy = levels.setdefault(level, {})
+
+        if not isinstance(level_policy, dict):
+            raise ValueError(f"xray-template.json field `policy.levels.{level}` must be an object")
+
+        level_policy["statsUserUplink"] = True
+        level_policy["statsUserDownlink"] = True
+
+
+def write_xray_config_file(path: str, quota: Dict[str, Any], state: Dict[str, Any]) -> int:
+    template = load_json(XRAY_TEMPLATE)
+    clients = build_clients(quota, state)
+    config = inject_clients_into_xray_template(template, clients)
+    ensure_xray_user_stats_enabled(config, quota)
+    save_json_atomic(path, config)
+    return len(clients)
+
+
+def validate_xray_config(path: str) -> None:
+    cmd = ["xray", "run", "-test", "-c", path]
+
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=20)
+    except Exception as e:
+        raise XrayConfigError(f"failed running xray config test: {e}") from e
+
+    if result.returncode != 0:
+        stderr = result.stderr.strip()
+        stdout = result.stdout.strip()
+        raise XrayConfigError(stderr or stdout or f"xray config test failed with code {result.returncode}")
+
+
+def write_validated_xray_config(quota: Dict[str, Any], state: Dict[str, Any]) -> None:
+    candidate = f"{XRAY_GENERATED_CONFIG}.candidate"
+    active_clients = write_xray_config_file(candidate, quota, state)
+    validate_xray_config(candidate)
+    Path(candidate).replace(XRAY_GENERATED_CONFIG)
+    log(f"[xray] generated validated config with {active_clients} active client(s)")
+
+
+def validate_singbox_config(path: str) -> None:
+    cmd = ["sing-box", "check", "-c", path]
+
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=20)
+    except Exception as e:
+        raise SingBoxConfigError(f"failed running sing-box config check: {e}") from e
+
+    if result.returncode != 0:
+        stderr = result.stderr.strip()
+        stdout = result.stdout.strip()
+        raise SingBoxConfigError(stderr or stdout or f"sing-box config check failed with code {result.returncode}")
+
+
+def write_validated_singbox_config() -> None:
+    candidate = f"{SINGBOX_GENERATED_CONFIG}.candidate"
+    target = Path(candidate)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(SINGBOX_CONFIG, candidate)
+    validate_singbox_config(candidate)
+    Path(candidate).replace(SINGBOX_GENERATED_CONFIG)
+    log("[sing-box] generated validated config")
+
+
+def mark_current_xray_config_good() -> None:
+    shutil.copyfile(XRAY_GENERATED_CONFIG, XRAY_LAST_GOOD_CONFIG)
+
+
+def mark_current_singbox_config_good() -> None:
+    shutil.copyfile(SINGBOX_GENERATED_CONFIG, SINGBOX_LAST_GOOD_CONFIG)
+
+
+def start_xray_process(config_path: str = XRAY_GENERATED_CONFIG) -> subprocess.Popen:
+    proc = start_process("xray", ["xray", "run", "-c", config_path])
+
+    if XRAY_STARTUP_GRACE_SECONDS > 0:
+        time.sleep(XRAY_STARTUP_GRACE_SECONDS)
+
+    if proc.poll() is not None:
+        raise XrayProcessError(f"xray exited during startup with code {proc.returncode}")
+
+    return proc
+
+
+def start_singbox_process(config_path: str = SINGBOX_GENERATED_CONFIG) -> subprocess.Popen:
+    proc = start_process("sing-box", ["sing-box", "run", "-c", config_path])
+
+    if SINGBOX_STARTUP_GRACE_SECONDS > 0:
+        time.sleep(SINGBOX_STARTUP_GRACE_SECONDS)
+
+    if proc.poll() is not None:
+        raise SingBoxProcessError(f"sing-box exited during startup with code {proc.returncode}")
+
+    return proc
+
+
+def start_process(name: str, args: List[str]) -> subprocess.Popen:
+    log(f"[process] starting {name}: {' '.join(args)}")
+    return subprocess.Popen(args)
+
+
+def stop_process(name: str, proc: Optional[subprocess.Popen], timeout: int = 10) -> None:
+    if proc is None:
+        return
+
+    if proc.poll() is not None:
+        return
+
+    log(f"[process] stopping {name}")
+    proc.terminate()
+
+    try:
+        proc.wait(timeout=timeout)
+        log(f"[process] stopped {name}")
+    except subprocess.TimeoutExpired:
+        log(f"[process] killing {name}")
+        proc.kill()
+        proc.wait(timeout=timeout)
+
+
+def restart_xray_from_generated_config(current_proc: Optional[subprocess.Popen]) -> subprocess.Popen:
+    has_last_good = os.path.exists(XRAY_LAST_GOOD_CONFIG)
+    stop_process("xray", current_proc)
+
+    try:
+        proc = start_xray_process(XRAY_GENERATED_CONFIG)
+        mark_current_xray_config_good()
+        return proc
+    except XrayProcessError:
+        if not has_last_good:
+            raise
+
+        log("[xray] new config failed at startup, rolling back to last-known-good config")
+        shutil.copyfile(XRAY_LAST_GOOD_CONFIG, XRAY_GENERATED_CONFIG)
+        proc = start_xray_process(XRAY_GENERATED_CONFIG)
+        log("[xray] rollback to last-known-good config completed")
+        return proc
+
+
+def restart_xray(current_proc: Optional[subprocess.Popen], quota: Dict[str, Any], state: Dict[str, Any]) -> subprocess.Popen:
+    write_validated_xray_config(quota, state)
+    return restart_xray_from_generated_config(current_proc)
+
+
+def restart_singbox_from_generated_config(current_proc: Optional[subprocess.Popen]) -> subprocess.Popen:
+    has_last_good = os.path.exists(SINGBOX_LAST_GOOD_CONFIG)
+    stop_process("sing-box", current_proc)
+
+    try:
+        proc = start_singbox_process(SINGBOX_GENERATED_CONFIG)
+        mark_current_singbox_config_good()
+        return proc
+    except SingBoxProcessError:
+        if not has_last_good:
+            raise
+
+        log("[sing-box] new config failed at startup, rolling back to last-known-good config")
+        shutil.copyfile(SINGBOX_LAST_GOOD_CONFIG, SINGBOX_GENERATED_CONFIG)
+        proc = start_singbox_process(SINGBOX_GENERATED_CONFIG)
+        log("[sing-box] rollback to last-known-good config completed")
+        return proc
+
+
+def restart_singbox(current_proc: Optional[subprocess.Popen]) -> subprocess.Popen:
+    write_validated_singbox_config()
+    return restart_singbox_from_generated_config(current_proc)
+
+
+def parse_xray_stats_output(text: str) -> Dict[str, int]:
+    if not text.strip():
+        return {}
+
+    try:
+        data = json.loads(text)
+    except Exception as e:
+        raise XrayStatsError(f"failed to parse xray stats response as JSON: {e}") from e
+
+    stats = data.get("stat", [])
+    if isinstance(stats, dict):
+        stats = [stats]
+    if not isinstance(stats, list):
+        raise XrayStatsError("xray stats response field `stat` is not a list")
+
+    parsed = {}
+    for item in stats:
+        if not isinstance(item, dict):
+            continue
+        name = item.get("name")
+        if not isinstance(name, str):
+            continue
+        try:
+            parsed[name] = int(item.get("value", 0))
+        except Exception:
+            parsed[name] = 0
+
+    return parsed
+
+
+def query_xray_user_stats() -> Dict[str, int]:
+    cmd = [
+        "xray",
+        "api",
+        "statsquery",
+        "--server",
+        XRAY_API_SERVER,
+        "-pattern",
+        "user>>>",
+        "-reset=false"
+    ]
+
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+    except Exception as e:
+        raise XrayStatsError(f"failed running xray stats API: {e}") from e
+
+    if result.returncode != 0:
+        stderr = result.stderr.strip()
+        stdout = result.stdout.strip()
+        raise XrayStatsError(stderr or stdout or f"xray stats API failed with code {result.returncode}")
+
+    return parse_xray_stats_output(result.stdout)
+
+
+def query_user_total_bytes(username: str, stats: Dict[str, int]) -> int:
+    uplink = stats.get(f"user>>>{username}>>>traffic>>>uplink", 0)
+    downlink = stats.get(f"user>>>{username}>>>traffic>>>downlink", 0)
+    return uplink + downlink
+
+
+def update_usage_from_xray(state: Dict[str, Any], quota: Dict[str, Any], stats: Dict[str, int]) -> bool:
+    changed = False
+
+    for username in quota["users"].keys():
+        user_state = state["users"].setdefault(username, {
+            "used_bytes": 0,
+            "last_xray_total_bytes": 0,
+            "disabled": False,
+            "disabled_at": None
+        })
+
+        if user_state.get("disabled", False):
+            continue
+
+        current_total = query_user_total_bytes(username, stats)
+        last_total = int(user_state.get("last_xray_total_bytes", 0))
+
+        if current_total >= last_total:
+            delta = current_total - last_total
+        else:
+            delta = current_total
+
+        if delta > 0:
+            user_state["used_bytes"] = int(user_state.get("used_bytes", 0)) + delta
+            user_state["last_xray_total_bytes"] = current_total
+            changed = True
+            log(f"[usage] {username}: +{delta} bytes, total={user_state['used_bytes']}")
+
+    return changed
+
+
+def enforce_quota(state: Dict[str, Any], quota: Dict[str, Any]) -> bool:
+    disabled_changed = False
+
+    for username, user in quota["users"].items():
+        limit = int(user["daily_limit_bytes"])
+        user_state = state["users"].setdefault(username, {
+            "used_bytes": 0,
+            "last_xray_total_bytes": 0,
+            "disabled": False,
+            "disabled_at": None
+        })
+
+        used = int(user_state.get("used_bytes", 0))
+
+        if used >= limit and not user_state.get("disabled", False):
+            user_state["disabled"] = True
+            user_state["disabled_at"] = now_ts()
+            disabled_changed = True
+            log(f"[quota] disabled {username}: used={used}, limit={limit}")
+
+    return disabled_changed
+
+
+def graceful_shutdown(signum, frame) -> None:
+    raise KeyboardInterrupt()
+
+
+def main() -> int:
+    signal.signal(signal.SIGTERM, graceful_shutdown)
+    signal.signal(signal.SIGINT, graceful_shutdown)
+
+    Path("/etc/xray").mkdir(parents=True, exist_ok=True)
+    Path("/etc/sing-box").mkdir(parents=True, exist_ok=True)
+    Path("/data").mkdir(parents=True, exist_ok=True)
+    Path(RUNTIME_CONFIG_DIR).mkdir(parents=True, exist_ok=True)
+
+    config_mode = configure_runtime_config_files()
+    quota = normalize_quota(load_json(QUOTA_CONFIG))
+    state = load_state()
+
+    if ensure_state_users(state, quota):
+        save_json_atomic(STATE_FILE, state)
+
+    if should_reset(state, quota):
+        state = reset_state(state, quota)
+
+    write_validated_singbox_config()
+    write_validated_xray_config(quota, state)
+
+    config_hash = current_config_hash(config_mode)
+    disabled_snapshot = json.dumps(
+        {u: state["users"].get(u, {}).get("disabled", False) for u in quota["users"].keys()},
+        sort_keys=True
+    )
+
+    singbox_proc = None
+    xray_proc = None
+    stats_failure_count = 0
+
+    try:
+        singbox_proc = start_singbox_process(SINGBOX_GENERATED_CONFIG)
+        mark_current_singbox_config_good()
+        xray_proc = start_xray_process(XRAY_GENERATED_CONFIG)
+        mark_current_xray_config_good()
+
+        while True:
+            if singbox_proc.poll() is not None:
+                log(f"[warn] sing-box exited with code {singbox_proc.returncode}, restarting")
+                try:
+                    singbox_proc = restart_singbox_from_generated_config(singbox_proc)
+                except (SingBoxConfigError, SingBoxProcessError) as e:
+                    log(f"[fatal] cannot restart sing-box: {e}")
+                    return 1
+
+            if xray_proc.poll() is not None:
+                log(f"[warn] xray exited with code {xray_proc.returncode}, restarting")
+                try:
+                    xray_proc = restart_xray(xray_proc, quota, state)
+                except (XrayConfigError, XrayProcessError) as e:
+                    log(f"[fatal] cannot restart xray because generated config is invalid: {e}")
+                    return 1
+
+            try:
+                new_config_hash = current_config_hash(config_mode)
+                if new_config_hash != config_hash:
+                    log("[config] runtime config changed, reloading")
+                    if config_mode == "combined":
+                        extract_combined_config()
+
+                    next_quota = normalize_quota(load_json(QUOTA_CONFIG))
+                    next_state = copy.deepcopy(state)
+                    state_changed = ensure_state_users(next_state, next_quota)
+
+                    write_validated_singbox_config()
+                    write_validated_xray_config(next_quota, next_state)
+
+                    next_singbox_proc = restart_singbox_from_generated_config(singbox_proc)
+                    next_xray_proc = restart_xray_from_generated_config(xray_proc)
+
+                    quota = next_quota
+                    state = next_state
+                    config_hash = new_config_hash
+                    singbox_proc = next_singbox_proc
+                    xray_proc = next_xray_proc
+                    stats_failure_count = 0
+                    if state_changed:
+                        save_json_atomic(STATE_FILE, state)
+            except Exception as e:
+                log(f"[warn] failed to reload runtime config: {e}")
+
+            if should_reset(state, quota):
+                state = reset_state(state, quota)
+                try:
+                    xray_proc = restart_xray(xray_proc, quota, state)
+                except (XrayConfigError, XrayProcessError) as e:
+                    log(f"[fatal] cannot reset users because generated config is invalid: {e}")
+                    return 1
+
+            try:
+                stats = query_xray_user_stats()
+                stats_failure_count = 0
+            except XrayStatsError as e:
+                stats_failure_count += 1
+                log(f"[stats] xray stats API failed ({stats_failure_count}/{XRAY_API_MAX_FAILURES}): {e}")
+                if stats_failure_count >= XRAY_API_MAX_FAILURES:
+                    log("[fatal] xray stats API failure limit reached; exiting so the PaaS can restart the container")
+                    return 1
+
+                interval = int(quota.get("check_interval_seconds", 60))
+                time.sleep(max(5, interval))
+                continue
+
+            usage_changed = update_usage_from_xray(state, quota, stats)
+            disabled_changed = enforce_quota(state, quota)
+
+            if usage_changed or disabled_changed:
+                save_json_atomic(STATE_FILE, state)
+
+            current_disabled_snapshot = json.dumps(
+                {u: state["users"].get(u, {}).get("disabled", False) for u in quota["users"].keys()},
+                sort_keys=True
+            )
+
+            if disabled_changed or current_disabled_snapshot != disabled_snapshot:
+                disabled_snapshot = current_disabled_snapshot
+                try:
+                    xray_proc = restart_xray(xray_proc, quota, state)
+                except (XrayConfigError, XrayProcessError) as e:
+                    log(f"[fatal] cannot enforce quota because generated config is invalid: {e}")
+                    return 1
+
+            interval = int(quota.get("check_interval_seconds", 60))
+            time.sleep(max(5, interval))
+
+    except KeyboardInterrupt:
+        log("[shutdown] received shutdown signal")
+    finally:
+        stop_process("xray", xray_proc)
+        stop_process("sing-box", singbox_proc)
+
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except Exception as e:
+        log(f"[fatal] startup failed: {e}")
+        sys.exit(1)
