@@ -13,6 +13,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+import yaml
+
 
 SINGBOX_CONFIG = os.environ.get("SINGBOX_CONFIG", "/app/config/sing-box.json")
 SINGBOX_GENERATED_CONFIG = os.environ.get("SINGBOX_GENERATED_CONFIG", "/etc/sing-box/config.json")
@@ -20,6 +22,8 @@ SINGBOX_LAST_GOOD_CONFIG = os.environ.get("SINGBOX_LAST_GOOD_CONFIG", "/etc/sing
 XRAY_TEMPLATE = os.environ.get("XRAY_TEMPLATE", "/app/config/xray-template.json")
 QUOTA_CONFIG = os.environ.get("QUOTA_CONFIG", "/app/config/quota.json")
 COMBINED_CONFIG = os.environ.get("COMBINED_CONFIG", "/app/config/config.json")
+CUSTOM_CONFIG = os.environ.get("CUSTOM_CONFIG", "/app/config/custom-config.yaml")
+YAML_CONFIG = os.environ.get("YAML_CONFIG", "/app/config/config.yaml")
 CONFIG_MODE = os.environ.get("CONFIG_MODE", "auto")
 RUNTIME_CONFIG_DIR = os.environ.get("RUNTIME_CONFIG_DIR", "/run/xray-quota")
 XRAY_GENERATED_CONFIG = os.environ.get("XRAY_GENERATED_CONFIG", "/etc/xray/config.json")
@@ -63,6 +67,22 @@ def load_json(path: str) -> Dict[str, Any]:
         return json.load(f)
 
 
+def load_json_or_yaml(path: str) -> Dict[str, Any]:
+    suffix = Path(path).suffix.lower()
+    with open(path, "r", encoding="utf-8") as f:
+        if suffix in [".yaml", ".yml"]:
+            data = yaml.safe_load(f)
+        else:
+            data = json.load(f)
+
+    if data is None:
+        return {}
+    if not isinstance(data, dict):
+        raise ValueError(f"{path} must contain a JSON/YAML object")
+
+    return data
+
+
 def save_json_atomic(path: str, data: Dict[str, Any]) -> None:
     target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
@@ -97,6 +117,14 @@ def required_separate_config_files_exist() -> bool:
     return all(os.path.exists(path) for path in [SINGBOX_CONFIG, XRAY_TEMPLATE, QUOTA_CONFIG])
 
 
+def find_combined_config() -> Optional[str]:
+    for path in [COMBINED_CONFIG, CUSTOM_CONFIG, YAML_CONFIG]:
+        if os.path.exists(path):
+            return path
+
+    return None
+
+
 def get_config_section(bundle: Dict[str, Any], *names: str) -> Dict[str, Any]:
     for name in names:
         value = bundle.get(name)
@@ -109,9 +137,9 @@ def get_config_section(bundle: Dict[str, Any], *names: str) -> Dict[str, Any]:
 
 
 def extract_combined_config() -> None:
-    bundle = load_json(COMBINED_CONFIG)
+    bundle = load_json_or_yaml(COMBINED_CONFIG)
     if not isinstance(bundle, dict):
-        raise ValueError("combined config must be a JSON object")
+        raise ValueError("combined config must be a JSON/YAML object")
 
     runtime_dir = Path(RUNTIME_CONFIG_DIR)
     runtime_dir.mkdir(parents=True, exist_ok=True)
@@ -125,7 +153,7 @@ def extract_combined_config() -> None:
 
 
 def configure_runtime_config_files() -> str:
-    global SINGBOX_CONFIG, XRAY_TEMPLATE, QUOTA_CONFIG
+    global SINGBOX_CONFIG, XRAY_TEMPLATE, QUOTA_CONFIG, COMBINED_CONFIG
 
     mode = CONFIG_MODE.lower()
     if mode not in ["auto", "separate", "combined"]:
@@ -138,11 +166,13 @@ def configure_runtime_config_files() -> str:
     if mode == "separate":
         raise FileNotFoundError("CONFIG_MODE=separate but one or more separate config files are missing")
 
-    if not os.path.exists(COMBINED_CONFIG):
+    combined_config = find_combined_config()
+    if combined_config is None:
         raise FileNotFoundError(
-            "missing runtime config: provide separate sing-box/xray-template/quota files or a combined config.json"
+            "missing runtime config: provide separate sing-box/xray-template/quota files, config.json, or custom-config.yaml"
         )
 
+    COMBINED_CONFIG = combined_config
     runtime_dir = Path(RUNTIME_CONFIG_DIR)
     SINGBOX_CONFIG = str(runtime_dir / "sing-box.json")
     XRAY_TEMPLATE = str(runtime_dir / "xray-template.json")
@@ -339,7 +369,7 @@ def validate_xray_config(path: str) -> None:
 
 
 def write_validated_xray_config(quota: Dict[str, Any], state: Dict[str, Any]) -> None:
-    candidate = f"{XRAY_GENERATED_CONFIG}.candidate"
+    candidate = f"{XRAY_GENERATED_CONFIG}.candidate.json"
     active_clients = write_xray_config_file(candidate, quota, state)
     validate_xray_config(candidate)
     Path(candidate).replace(XRAY_GENERATED_CONFIG)
@@ -361,7 +391,7 @@ def validate_singbox_config(path: str) -> None:
 
 
 def write_validated_singbox_config() -> None:
-    candidate = f"{SINGBOX_GENERATED_CONFIG}.candidate"
+    candidate = f"{SINGBOX_GENERATED_CONFIG}.candidate.json"
     target = Path(candidate)
     target.parent.mkdir(parents=True, exist_ok=True)
     shutil.copyfile(SINGBOX_CONFIG, candidate)
