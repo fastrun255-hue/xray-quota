@@ -9,11 +9,17 @@ SINGBOX_CONFIG_PATH="${SINGBOX_CONFIG:-/app/config/sing-box.json}"
 XRAY_TEMPLATE_PATH="${XRAY_TEMPLATE:-/app/config/xray-template.json}"
 QUOTA_CONFIG_PATH="${QUOTA_CONFIG:-/app/config/quota.json}"
 COMBINED_CONFIG_PATH="${COMBINED_CONFIG:-/app/config/config.json}"
+CUSTOM_CONFIG_PATH="${CUSTOM_CONFIG:-/app/config/custom-config.yaml}"
+YAML_CONFIG_PATH="${YAML_CONFIG:-/app/config/config.yaml}"
 
 if [ -f "$SINGBOX_CONFIG_PATH" ] && [ -f "$XRAY_TEMPLATE_PATH" ] && [ -f "$QUOTA_CONFIG_PATH" ]; then
   echo "[start] using separate config files"
 elif [ -f "$COMBINED_CONFIG_PATH" ]; then
   echo "[start] using combined config file: $COMBINED_CONFIG_PATH"
+elif [ -f "$CUSTOM_CONFIG_PATH" ]; then
+  echo "[start] using custom config file: $CUSTOM_CONFIG_PATH"
+elif [ -f "$YAML_CONFIG_PATH" ]; then
+  echo "[start] using YAML config file: $YAML_CONFIG_PATH"
 else
   echo "[error] missing config"
   echo "[error] provide either:"
@@ -22,6 +28,8 @@ else
   echo "[error]   $QUOTA_CONFIG_PATH"
   echo "[error] or combined config:"
   echo "[error]   $COMBINED_CONFIG_PATH"
+  echo "[error]   $CUSTOM_CONFIG_PATH"
+  echo "[error]   $YAML_CONFIG_PATH"
 
   exit 1
 fi

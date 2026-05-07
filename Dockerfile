@@ -6,6 +6,7 @@ RUN apk add --no-cache \
     unzip \
     tar \
     python3 \
+    py3-yaml \
     ca-certificates \
     jq \
     procps

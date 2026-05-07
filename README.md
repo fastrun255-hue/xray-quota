@@ -6,13 +6,35 @@ The image contains no secrets, server addresses, UUIDs, passwords, or user quota
 
 ## Recommended PaaS Setup
 
-If your PaaS only lets you mount or edit one JSON config file, mount it here:
+If your PaaS only lets you mount or edit one config file, mount it here:
 
 ```text
 /app/config/config.json
 ```
 
-Use this top-level shape:
+This image also auto-detects these paths:
+
+```text
+/app/config/custom-config.yaml
+/app/config/config.yaml
+```
+
+Use this top-level shape for JSON or YAML:
+
+```yaml
+sing-box: {}
+xray-template: {}
+quota:
+  reset_interval_hours: 24
+  check_interval_seconds: 60
+  users:
+    user1:
+      uuid: 00000000-0000-4000-8000-000000000001
+      daily_limit_bytes: 2147483648
+      flow: xtls-rprx-vision
+```
+
+Equivalent JSON is also accepted:
 
 ```json
 {
@@ -88,6 +110,8 @@ Optional environment variables:
 ```text
 CONFIG_MODE=auto
 COMBINED_CONFIG=/app/config/config.json
+CUSTOM_CONFIG=/app/config/custom-config.yaml
+YAML_CONFIG=/app/config/config.yaml
 RUNTIME_CONFIG_DIR=/run/xray-quota
 SINGBOX_CONFIG=/app/config/sing-box.json
 SINGBOX_GENERATED_CONFIG=/etc/sing-box/config.json
