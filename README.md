@@ -1,296 +1,146 @@
 # xray-quota
 
-Docker image for running Xray-core, sing-box, and a Python quota controller.
+Fast sing-box image for a paid VLESS WebSocket to Hysteria2 VPN.
 
-The image contains no secrets, server addresses, UUIDs, passwords, or user quota data. All real runtime configuration must be provided by the PaaS.
-
-## Recommended PaaS Setup
-
-If your PaaS only lets you mount or edit one config file, mount it here:
+Runtime traffic path:
 
 ```text
-/app/config/config.json
+client -> sing-box VLESS WS inbound -> sing-box Hysteria2 outbound
 ```
 
-This image also auto-detects these paths:
+The quota controller is outside the traffic path. It reads the same PaaS config, enables sing-box user stats, stores usage in `/data/usage-state.json`, and removes a user from the generated sing-box config after that user reaches the paid traffic limit.
+
+## PaaS Config
+
+The image auto-detects these files:
 
 ```text
 /app/config/custom-config.yaml
 /app/config/config.yaml
+/app/config/config.json
+/app/config/sing-box.json
+/etc/sing-box/config.json
 ```
 
-Use this top-level shape for JSON or YAML:
+For your PaaS setup, keep everything in `custom-config.yaml`.
+
+## Recommended Shape
+
+You can put quota fields directly on each VLESS user. The controller removes those fields before writing the generated sing-box config.
 
 ```yaml
-sing-box: {}
-xray-template: {}
+sing-box:
+  log:
+    level: warn
+    output: stdout
+  inbounds:
+    - type: vless
+      tag: vless-in
+      listen: 0.0.0.0
+      listen_port: 8081
+      users:
+        - name: user1
+          uuid: 47869f00-d04b-4ca8-ab92-bc29c72012ea
+          quota_bytes: 107374182400
+          reset_interval_hours: 720
+          reset_key: "user1-2026-05"
+      transport:
+        type: ws
+        path: /myvpn
+  outbounds:
+    - type: hysteria2
+      tag: foreign-server-out
+      server: YOUR-HYSTERIA2-SERVER-IP
+      server_port: 443
+      password: "6969"
+      up_mbps: 1000
+      down_mbps: 1000
+      tls:
+        enabled: true
+        server_name: bing.com
+        insecure: true
+    - type: direct
+      tag: direct-out
+  route:
+    rules:
+      - inbound: vless-in
+        outbound: foreign-server-out
+    final: direct-out
+
 quota:
-  reset_interval_hours: 24
-  check_interval_seconds: 60
-  users:
-    user1:
-      uuid: 00000000-0000-4000-8000-000000000001
-      daily_limit_bytes: 2147483648
-      reset_interval_hours: 24
-      flow: xtls-rprx-vision
+  check_interval_seconds: 30
+  reset_interval_hours: 720
+  auto_optimize: true
 ```
 
-Equivalent JSON is also accepted:
-
-```json
-{
-  "sing-box": {},
-  "xray-template": {},
-  "quota": {
-    "reset_interval_hours": 24,
-    "check_interval_seconds": 60,
-    "users": {
-      "user1": {
-        "uuid": "00000000-0000-4000-8000-000000000001",
-        "daily_limit_bytes": 2147483648,
-        "reset_interval_hours": 24,
-        "flow": "xtls-rprx-vision"
-      }
-    }
-  }
-}
-```
-
-The `sing-box` object is your full sing-box config. The `xray-template` object is your full Xray config without real clients in the quota-managed inbound. The `quota` object contains users, traffic limits, and reset intervals.
-
-Quota user fields other than `uuid`, `daily_limit_bytes`, `reset_interval_hours`, `level`, and `client` are passed into the generated Xray client object. This is useful for VLESS fields such as `flow`.
-
-## Separate File Mode
-
-You can also mount three separate files:
+Supported per-user quota fields:
 
 ```text
-/app/config/sing-box.json
-/app/config/xray-template.json
-/app/config/quota.json
+quota_bytes
+traffic_limit_bytes
+daily_limit_bytes
+limit_bytes
+reset_interval_hours
+reset_key
+renewal_key
+enabled
+disabled
 ```
 
-`CONFIG_MODE=auto` uses separate files if all three exist, otherwise it uses `/app/config/config.json`.
+`name` is important. sing-box stats are counted by user name. If a user has no `name`, the controller uses the UUID as the name.
 
-## Persistent State
+## Renewing Users
 
-Mount a persistent disk to:
+Because the PaaS `/data` volume is not manually accessible, renew a user from config:
+
+```yaml
+reset_key: "user1-2026-06"
+```
+
+Changing `reset_key` resets that user's stored usage and enables the user again. Changing the UUID also resets that user's stored usage.
+
+Use `reset_interval_hours: 0` for one-time traffic packages that should never automatically reset.
+
+## ConfigMap Wrapper
+
+The controller can also read a PaaS configmap wrapper containing `config.json`. This shape is accepted:
+
+```yaml
+configmap:
+  configmapItems:
+    singbox-config:
+      path: /etc/sing-box/config.json
+      subPath: config.json
+      value:
+        config.json: |-
+          {
+            "log": { "level": "warn", "output": "stdout" },
+            "inbounds": [],
+            "outbounds": [],
+            "route": {},
+            "quota": {}
+          }
+```
+
+## Speed Notes
+
+The image builds sing-box from source with the V2Ray API enabled so per-user stats work. The V2Ray API is used only for accounting; it is not in the VPN traffic path.
+
+For Hysteria2, set `up_mbps` and `down_mbps` to the real bandwidth of the Hysteria2 server. Too-low values can cap speed. Too-high values can make congestion behavior worse on weak links.
+
+The controller sets these performance defaults when `quota.auto_optimize` is not false:
 
 ```text
-/data
+log.level = warn
+log.output = stdout
+vless inbound tcp_fast_open = true
+vless inbound reuse_addr = true
 ```
 
-Usage state is stored at:
+## Ports
 
-```text
-/data/usage-state.json
-```
-
-Without a persistent `/data` volume, users' daily usage can reset on redeploy.
-
-## Quota Sizing
-
-`daily_limit_bytes` is the traffic cap for one user's reset period. Examples:
-
-```text
-1 GiB  = 1073741824
-2 GiB  = 2147483648
-5 GiB  = 5368709120
-10 GiB = 10737418240
-```
-
-If someone pays for 90 GiB/month, a simple daily quota is:
-
-```text
-90 * 1073741824 / 30 = 3221225472 bytes/day
-```
-
-## Per-User Reset Intervals
-
-Global `reset_interval_hours` is the default for every user. A user can override it:
-
-```json
-{
-  "reset_interval_hours": 24,
-  "users": {
-    "daily-user": {
-      "uuid": "00000000-0000-4000-8000-000000000001",
-      "daily_limit_bytes": 5368709120,
-      "reset_interval_hours": 24
-    },
-    "weekly-user": {
-      "uuid": "00000000-0000-4000-8000-000000000002",
-      "daily_limit_bytes": 37580963840,
-      "reset_interval_hours": 168
-    },
-    "monthly-user": {
-      "uuid": "00000000-0000-4000-8000-000000000003",
-      "daily_limit_bytes": 161061273600,
-      "reset_interval_hours": 720
-    },
-    "one-time-user": {
-      "uuid": "00000000-0000-4000-8000-000000000004",
-      "daily_limit_bytes": 10737418240,
-      "reset_interval_hours": 0
-    }
-  }
-}
-```
-
-Use `reset_interval_hours: 0` for one-time users who should not reset automatically.
-
-## Environment Variables
-
-Optional environment variables:
-
-```text
-CONFIG_MODE=auto
-COMBINED_CONFIG=/app/config/config.json
-CUSTOM_CONFIG=/app/config/custom-config.yaml
-YAML_CONFIG=/app/config/config.yaml
-RUNTIME_CONFIG_DIR=/run/xray-quota
-SINGBOX_CONFIG=/app/config/sing-box.json
-SINGBOX_GENERATED_CONFIG=/etc/sing-box/config.json
-SINGBOX_LAST_GOOD_CONFIG=/etc/sing-box/config.last-good.json
-SINGBOX_STARTUP_GRACE_SECONDS=1
-ENABLE_HTTP_FRONTEND=true
-PUBLIC_HTTP_PORT=8080
-XRAY_PROXY_HOST=127.0.0.1
-XRAY_PROXY_PORT=10000
-XRAY_WS_PATH=
-NGINX_GENERATED_CONFIG=/etc/nginx/http.d/xray-quota.conf
-QUOTA_UI_HOST=0.0.0.0
-QUOTA_UI_PORT=9090
-ADMIN_USERNAME=
-ADMIN_PASSWORD=
-XRAY_TEMPLATE=/app/config/xray-template.json
-QUOTA_CONFIG=/app/config/quota.json
-XRAY_GENERATED_CONFIG=/etc/xray/config.json
-XRAY_LAST_GOOD_CONFIG=/etc/xray/config.last-good.json
-STATE_FILE=/data/usage-state.json
-XRAY_API_SERVER=127.0.0.1:10085
-XRAY_INBOUND_TAG=vless-in
-XRAY_API_MAX_FAILURES=5
-XRAY_STARTUP_GRACE_SECONDS=1
-XRAY_LOCATION_ASSET=/usr/local/share/xray
-```
-
-## Xray Template Requirements
-
-The Xray template must include:
-
-* An inbound with tag matching `XRAY_INBOUND_TAG`, default: `vless-in`
-* Xray API with `StatsService` enabled on `127.0.0.1:10085`
-* An API inbound routed to the `api` outbound
-* An outbound pointing to local sing-box SOCKS, usually `127.0.0.1:10808`
-
-The quota controller injects active users into:
-
-```json
-inbounds[].settings.clients
-```
-
-for the inbound tagged `vless-in`.
-
-The controller also enables Xray user uplink/downlink stats for every quota user level in the generated config.
-
-Generic Xray API pieces needed in your template:
-
-```json
-{
-  "api": {
-    "tag": "api",
-    "services": ["StatsService"]
-  },
-  "inbounds": [
-    {
-      "tag": "api",
-      "listen": "127.0.0.1",
-      "port": 10085,
-      "protocol": "dokodemo-door",
-      "settings": {
-        "address": "127.0.0.1"
-      }
-    }
-  ],
-  "outbounds": [
-    {
-      "tag": "api",
-      "protocol": "freedom"
-    }
-  ],
-  "routing": {
-    "rules": [
-      {
-        "type": "field",
-        "inboundTag": ["api"],
-        "outboundTag": "api"
-      }
-    ]
-  }
-}
-```
-
-## Runtime Behavior
-
-1. The controller loads either `/app/config/config.json` or the three separate config files.
-2. It validates sing-box with `sing-box check -c`.
-3. It generates and validates Xray config with `xray run -test`.
-4. It starts sing-box and Xray.
-5. It queries Xray user stats through `xray api statsquery -pattern "user>>>"`.
-6. If a user exceeds their daily quota, the controller removes that user from generated Xray config and restarts Xray.
-7. After each user's reset interval, that user's quota counter resets and the user is enabled again.
-8. Runtime config changes are reloaded automatically.
-9. Repeated stats API failures make the controller exit non-zero so the PaaS can restart the container.
-
-## Quota UI
-
-By default, the container starts an HTTP frontend on public port `8080`:
-
-* `http://HOST/` shows the quota page.
-* `http://HOST/admin` shows the admin page for all users.
-* The Xray WebSocket path, for example `/myvpn`, is proxied to Xray internally.
-* The quota UI still runs internally on port `9090`.
-
-This lets PaaS providers expose one HTTP service port while keeping the VPN and quota page on the same domain.
-
-If `ENABLE_HTTP_FRONTEND=false`, the quota page is exposed directly on:
-
-```text
-http://HOST:9090/
-```
-
-Users enter their username and see:
-
-* Traffic limit in MB
-* Current period traffic usage in MB
-* Remaining current period usage in MB
-* Time till reset as `hr:min`
-
-There is also a JSON endpoint:
-
-```text
-/api/quota?user=user01
-```
-
-The admin page shows every user's traffic limit, current usage, remaining usage, reset interval, time till reset, and active/disabled status:
-
-```text
-/admin
-/api/admin
-```
-
-Set both `ADMIN_USERNAME` and `ADMIN_PASSWORD` to protect `/admin` and `/api/admin` with browser Basic Auth. If both are empty, the admin page is open.
-
-Expose container port `9090` in the PaaS only if users should access this page directly instead of through the default HTTP frontend.
+The image exposes `8081`. Your PaaS public service should route to the same port used by the VLESS inbound `listen_port`.
 
 ## Security
 
-Never commit:
-
-* Real UUIDs
-* Server IPs
-* Hysteria2 passwords
-* Domains
-* User quota data
-* Production config files
+Do not commit production UUIDs, server IPs, Hysteria2 passwords, domains, or real paid-user quota data unless this private repository is where you intentionally manage that config.
