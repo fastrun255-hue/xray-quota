@@ -312,6 +312,7 @@ def prepare_runtime_config(source: Dict[str, Any], quota: Dict[str, Any], state:
             continue
 
         vless_found = True
+        inbound.pop("reuse_addr", None)
         if defaults["auto_optimize"]:
             inbound.setdefault("tcp_fast_open", True)
 
