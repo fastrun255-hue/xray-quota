@@ -314,7 +314,6 @@ def prepare_runtime_config(source: Dict[str, Any], quota: Dict[str, Any], state:
         vless_found = True
         if defaults["auto_optimize"]:
             inbound.setdefault("tcp_fast_open", True)
-            inbound.setdefault("reuse_addr", True)
 
         original_users = inbound.get("users")
         if not original_users and isinstance(quota.get("users"), dict):

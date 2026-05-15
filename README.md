@@ -134,7 +134,6 @@ The controller sets these performance defaults when `quota.auto_optimize` is not
 log.level = warn
 log.output = stdout
 vless inbound tcp_fast_open = true
-vless inbound reuse_addr = true
 ```
 
 ## Ports
